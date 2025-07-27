@@ -1,0 +1,13 @@
+streamlit>=1.25
+geopandas>=0.13
+pandas>=1.5
+numpy>=1.23
+matplotlib>=3.7
+scipy>=1.10
+arviz>=0.16
+numpyro>=0.13
+jax[cpu]>=0.4
+shapely>=2.0
+pyproj>=3.5
+fiona>=1.9
+bstpp @ git+https://github.com/sylvainhalle/bstpp.git
