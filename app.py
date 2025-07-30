@@ -1,6 +1,3 @@
-Claro, aquí tienes el código completo y corregido de tu app Streamlit para que puedas subir eventos, covariables (por secciones censales), elegir variables para el modelo y entrenar/predicción con Random Forest usando esas covariables:
-
-```python
 import streamlit as st
 import pandas as pd
 import geopandas as gpd
@@ -196,4 +193,3 @@ if st.button("Ejecutar simulación"):
     joined_test = gpd.sjoin(df_next, df_test_month, predicate='contains', how='left')
     joined_test["actual_label"] = joined_test["index_right"].notnull().astype(int)
     evaluated = joined_test.groupby("cell_id").agg(
-```
