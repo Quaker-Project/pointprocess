@@ -12,6 +12,7 @@ import os
 import tempfile
 import zipfile
 from dateutil.parser import parse
+import json
 
 st.title("Simulación de riesgo espacial de eventos delictivos")
 
@@ -73,22 +74,17 @@ gdf_grid = gpd.GeoDataFrame({'cell_id': cell_ids}, geometry=polygons, crs=gdf.cr
 gdf_grid["X"] = gdf_grid.geometry.centroid.x
 gdf_grid["Y"] = gdf_grid.geometry.centroid.y
 
-# Spatial join con covariables por polígono
+# Spatial join con covariables
 if ruta_covariables is not None:
     gdf_cov = cargar_shapefile_zip(ruta_covariables)
     gdf_cov = gdf_cov.to_crs(gdf.crs)
-
-    # Join espacial: asigna atributos de polígono a celda (rejilla)
     gdf_grid = gpd.sjoin(gdf_grid, gdf_cov, predicate="intersects", how="left")
-
-    # Eliminar columnas innecesarias del join
     if "index_right" in gdf_grid.columns:
         gdf_grid = gdf_grid.drop(columns=["index_right"])
 
-# Detectar columnas disponibles como covariables
+# Selección de covariables
 excluded_cols = {"geometry", "cell_id", "X", "Y"}
 covariable_cols = [col for col in gdf_grid.columns if col not in excluded_cols and pd.api.types.is_numeric_dtype(gdf_grid[col])]
-
 selected_vars = st.multiselect("Selecciona las covariables a usar en el modelo", covariable_cols)
 
 if len(selected_vars) == 0:
@@ -98,7 +94,6 @@ if len(selected_vars) == 0:
 mes_entreno_inicio = pd.Period(fecha_entreno_inicio, freq="M")
 mes_entreno_fin = pd.Period(fecha_entreno_fin, freq="M")
 mes_sim = pd.Period(mes_simulacion, freq="M")
-
 train_months = [m for m in sorted(gdf["month"].unique()) if mes_entreno_inicio <= m <= mes_entreno_fin]
 
 if mes_sim not in gdf["month"].unique():
@@ -125,10 +120,8 @@ if st.button("Ejecutar simulación"):
         data.append(merged)
 
     df_model = pd.concat(data, ignore_index=True)
-
     feature_cols = ["X", "Y"] + selected_vars
     df_model = df_model.dropna(subset=feature_cols + ["label"])
-
     X = df_model[feature_cols]
     y = df_model["label"]
 
@@ -172,7 +165,6 @@ if st.button("Ejecutar simulación"):
     plt.axis("off")
     st.pyplot(fig)
 
-    # Evaluación
     joined_test = gpd.sjoin(df_next, df_test_month, predicate='contains', how='left')
     joined_test["actual_label"] = joined_test["index_right"].notnull().astype(int)
     evaluated = joined_test.groupby("cell_id").agg(
@@ -182,7 +174,6 @@ if st.button("Ejecutar simulación"):
 
     y_true = evaluated["actual"]
     y_pred = evaluated["predicted"]
-
     precision = precision_score(y_true, y_pred)
     recall = recall_score(y_true, y_pred)
     f1 = f1_score(y_true, y_pred)
@@ -193,12 +184,17 @@ if st.button("Ejecutar simulación"):
     st.write(f"F1-score:  {f1:.2f}")
 
     def to_geojson_bytes(gdf):
-        return gdf.to_json().encode('utf-8')
+        columnas_validas = ["cell_id", "predicted_prob", "predicted_risk", "geometry"]
+        columnas_validas += [col for col in gdf.columns if col.startswith("var_")]  # opcional
+        gdf_out = gdf[columnas_validas].copy()
+        return gdf_out.to_json().encode('utf-8')
 
     def to_shapefile_bytes(gdf):
         with tempfile.TemporaryDirectory() as tmpdir:
             shp_path = os.path.join(tmpdir, "prediccion.shp")
-            gdf.to_file(shp_path)
+            columnas_export = ["cell_id", "predicted_prob", "predicted_risk"]
+            columnas_export = [col for col in columnas_export if col in gdf.columns]
+            gdf[columnas_export + ["geometry"]].to_file(shp_path)
             zip_buffer = io.BytesIO()
             with zipfile.ZipFile(zip_buffer, "w") as zf:
                 for ext in [".shp", ".shx", ".dbf", ".prj", ".cpg"]:
