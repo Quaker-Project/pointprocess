@@ -26,7 +26,6 @@ mes_simulacion = st.text_input("Mes a simular (formato YYYY-MM)", "2019-09")
 fecha_entreno_inicio = st.text_input("Fecha inicio entrenamiento (YYYY-MM)", "2017-01")
 fecha_entreno_fin = st.text_input("Fecha fin entrenamiento (YYYY-MM)", "2019-08")
 
-# Nuevo input para título personalizado
 titulo_mapa = st.text_input("Título del mapa", f"Riesgo predicho vs hurtos reales - {mes_simulacion}")
 
 def cargar_shapefile_zip(zip_file):
@@ -59,9 +58,11 @@ def parse_fecha_segura(fecha):
         return pd.NaT
 
 gdf["Fecha"] = gdf["Fecha"].apply(parse_fecha_segura)
+
 errores = gdf[gdf["Fecha"].isna()]
 if not errores.empty:
     st.warning(f"No se pudieron reconocer {len(errores)} fechas y serán descartadas.")
+
 gdf = gdf.dropna(subset=["Fecha"])
 gdf["month"] = gdf["Fecha"].dt.to_period("M")
 
@@ -80,19 +81,7 @@ gdf_grid = gpd.GeoDataFrame({'cell_id': cell_ids}, geometry=polygons, crs=gdf.cr
 gdf_grid["X"] = gdf_grid.geometry.centroid.x
 gdf_grid["Y"] = gdf_grid.geometry.centroid.y
 
-mes_entreno_inicio = pd.Period(fecha_entreno_inicio, freq="M")
-mes_entreno_fin = pd.Period(fecha_entreno_fin, freq="M")
-mes_sim = pd.Period(mes_simulacion, freq="M")
-
-train_months = [m for m in sorted(gdf["month"].unique()) if mes_entreno_inicio <= m <= mes_entreno_fin]
-if mes_sim not in gdf["month"].unique():
-    st.error(f"Mes de simulación {mes_simulacion} no está en los datos.")
-    st.stop()
-if len(train_months) == 0:
-    st.error("No hay meses de entrenamiento válidos en el rango seleccionado.")
-    st.stop()
-
-# Carga covariables y selecciona variables numéricas para multiselect
+# Cargar y preparar covariables (si existen)
 gdf_covars = None
 selected_vars = []
 if ruta_covars is not None:
@@ -106,6 +95,25 @@ if ruta_covars is not None:
     else:
         st.warning("No se pudo cargar correctamente el shapefile de covariables.")
 
+# Agregar covariables a la rejilla por celda haciendo overlay espacial y agregando media
+if gdf_covars is not None and selected_vars:
+    overlay = gpd.overlay(gdf_grid, gdf_covars, how='intersection')
+    agg_covars = overlay.groupby('cell_id')[selected_vars].mean().reset_index()
+    gdf_grid = gdf_grid.merge(agg_covars, on='cell_id', how='left')
+
+mes_entreno_inicio = pd.Period(fecha_entreno_inicio, freq="M")
+mes_entreno_fin = pd.Period(fecha_entreno_fin, freq="M")
+mes_sim = pd.Period(mes_simulacion, freq="M")
+
+train_months = [m for m in sorted(gdf["month"].unique()) if mes_entreno_inicio <= m <= mes_entreno_fin]
+if mes_sim not in gdf["month"].unique():
+    st.error(f"Mes de simulación {mes_simulacion} no está en los datos.")
+    st.stop()
+
+if len(train_months) == 0:
+    st.error("No hay meses de entrenamiento válidos en el rango seleccionado.")
+    st.stop()
+
 st.write(f"Entrenando con meses desde {fecha_entreno_inicio} hasta {fecha_entreno_fin}")
 st.write(f"Simulando mes: {mes_simulacion}")
 
@@ -114,41 +122,21 @@ if st.button("Ejecutar simulación"):
     data = []
     for m in tqdm(train_months, desc="Generando dataset de entrenamiento"):
         df_month = gdf[gdf["month"] == m]
-        # Join espacial para etiquetas
+        # sjoin para marcar celdas que contienen eventos (label 1)
         joined = gpd.sjoin(gdf_grid, df_month, predicate='contains', how='left')
         joined["label"] = joined["index_right"].notnull().astype(int)
         grouped = joined.groupby("cell_id").agg(label=("label", "max")).reset_index()
-        merged = pd.merge(grouped, gdf_grid, on="cell_id")
+
+        # Unir etiquetas a la rejilla con covariables
+        merged = pd.merge(grouped, gdf_grid, on="cell_id", how='left')
         merged = gpd.GeoDataFrame(merged, geometry="geometry", crs=gdf.crs)
-
-        # Si hay covariables y variables seleccionadas, unir por intersección espacial (sjoin)
-        if gdf_covars is not None and selected_vars:
-            inter = gpd.sjoin(merged, gdf_covars[['geometry'] + selected_vars], how="left", predicate='intersects')
-            inter = inter.drop(columns=['index_right'])
-            # Dejar una fila por celda_id con covariables promedio (en caso de múltiples intersecciones)
-            agg_dict = {var: "mean" for var in selected_vars}
-            inter_agg = inter.groupby("cell_id").agg(agg_dict).reset_index()
-            # Merge con merged para añadir covariables
-            merged = pd.merge(merged.drop(columns=selected_vars, errors='ignore'), inter_agg, on='cell_id', how='left')
-            merged = gpd.GeoDataFrame(merged, geometry="geometry", crs=gdf.crs)
-
         merged["month"] = str(m)
         data.append(merged)
 
     df_model = pd.concat(data, ignore_index=True)
 
-    st.write("Columnas en df_model:", df_model.columns.tolist())
-    st.write("Variables seleccionadas:", selected_vars)
-
-    # Sólo usar variables que estén en df_model para evitar KeyError
-    base_vars = ["X", "Y"]
-    vars_disponibles = [v for v in selected_vars if v in df_model.columns] if selected_vars else []
-    feature_vars = base_vars + vars_disponibles
-
-    if len(feature_vars) == 0:
-        st.error("No hay variables predictoras disponibles para entrenar el modelo.")
-        st.stop()
-
+    # Variables predictoras: siempre X,Y + covariables seleccionadas (si hay)
+    feature_vars = ["X", "Y"] + selected_vars if selected_vars else ["X", "Y"]
     X = df_model[feature_vars].fillna(0)
     y = df_model["label"]
 
@@ -157,15 +145,7 @@ if st.button("Ejecutar simulación"):
 
     # Preparar datos para predicción
     df_next = gdf_grid.copy()
-
-    if gdf_covars is not None and selected_vars:
-        inter_pred = gpd.sjoin(df_next, gdf_covars[['geometry'] + selected_vars], how="left", predicate='intersects')
-        inter_pred = inter_pred.drop(columns=['index_right'])
-        agg_dict = {var: "mean" for var in selected_vars}
-        inter_agg_pred = inter_pred.groupby("cell_id").agg(agg_dict).reset_index()
-        df_next = pd.merge(df_next.drop(columns=selected_vars, errors='ignore'), inter_agg_pred, on='cell_id', how='left')
-        df_next = gpd.GeoDataFrame(df_next, geometry="geometry", crs=gdf.crs)
-
+    # Ya tiene covariables porque se agregaron antes
     X_pred = df_next[feature_vars].fillna(0)
 
     probs = model.predict_proba(X_pred)[:, 1]
@@ -182,27 +162,39 @@ if st.button("Ejecutar simulación"):
 
     st.write(f"Celdas con riesgo predicho == 1: {df_next['predicted_risk'].sum()}")
 
-    # Plot mapa
-    fig, ax = plt.subplots(figsize=(10, 10))
-    df_next.plot(column="predicted_risk", cmap="Reds", legend=True, alpha=0.6, ax=ax)
-    df_test_month.plot(ax=ax, color="blue", markersize=10, label="Eventos reales")
+    fig, ax = plt.subplots(figsize=(12, 10))
+
     if gdf_contorno is not None:
-        gdf_contorno.boundary.plot(ax=ax, color="black", linewidth=1)
-    plt.title(titulo_mapa)
+        gdf_contorno.plot(ax=ax, facecolor="none", edgecolor="gray", alpha=0.6)
+
+    df_next_risk = df_next[df_next["predicted_risk"] == 1]
+    if not df_next_risk.empty:
+        df_next_risk.plot(ax=ax, facecolor="red", edgecolor="darkred", alpha=0.4, linewidth=0.7, label="Riesgo alto")
+    else:
+        st.warning("No se detectaron celdas con riesgo alto según el umbral.")
+
+    if not df_test_month.empty:
+        df_test_month.plot(ax=ax, color="black", markersize=8, alpha=0.7, label="Eventos reales")
+    else:
+        st.warning("No hay eventos reales para el mes seleccionado.")
+
     plt.legend()
+    plt.title(titulo_mapa)
     plt.axis("off")
     st.pyplot(fig)
 
-    # Métricas de evaluación en entrenamiento
-    y_pred_train = model.predict(X)
-    st.write("### Métricas de evaluación en datos de entrenamiento:")
-    st.write(f"Precisión: {precision_score(y, y_pred_train):.3f}")
-    st.write(f"Recall: {recall_score(y, y_pred_train):.3f}")
-    st.write(f"F1 score: {f1_score(y, y_pred_train):.3f}")
+    # Evaluación
+    joined_test = gpd.sjoin(df_next, df_test_month, predicate='contains', how='left')
+    joined_test["actual_label"] = joined_test["index_right"].notnull().astype(int)
+    evaluated = joined_test.groupby("cell_id").agg(
+        predicted=("predicted_risk", "max"),
+        actual=("actual_label", "max")
+    ).reset_index()
 
-    # Importancia variables
-    importancias = model.feature_importances_
-    df_importance = pd.DataFrame({"variable": feature_vars, "importancia": importancias}).sort_values(by="importancia", ascending=False)
-    st.write("Importancia de variables:")
-    st.dataframe(df_importance)
+    precision = precision_score(evaluated["actual"], evaluated["predicted"])
+    recall = recall_score(evaluated["actual"], evaluated["predicted"])
+    f1 = f1_score(evaluated["actual"], evaluated["predicted"])
 
+    st.write(f"**Precisión:** {precision:.3f}")
+    st.write(f"**Recall:** {recall:.3f}")
+    st.write(f"**F1 score:** {f1:.3f}")
