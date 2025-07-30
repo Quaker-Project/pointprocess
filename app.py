@@ -91,14 +91,24 @@ if st.button("Ejecutar simulación"):
         gdf_grid = gpd.sjoin(gdf_grid, gdf_covars[covars_seleccionadas + ["geometry"]], predicate="intersects", how="left")
 
     data = []
-    for m in tqdm(train_months, desc="Generando dataset de entrenamiento"):
+        for m in tqdm(train_months, desc="Generando dataset de entrenamiento"):
         df_month = gdf[gdf["month"] == m]
+
+        # Evitar colisiones de columnas reservadas por sjoin
+        for col in ['index_left', 'index_right']:
+            if col in gdf_grid.columns:
+                gdf_grid = gdf_grid.drop(columns=[col])
+            if col in df_month.columns:
+                df_month = df_month.drop(columns=[col])
+
         joined = gpd.sjoin(gdf_grid, df_month, predicate='contains', how='left')
         joined["label"] = joined["index_right"].notnull().astype(int)
+
         grouped = joined.groupby("cell_id").agg(label=("label", "max")).reset_index()
         merged = pd.merge(grouped, gdf_grid, on="cell_id")
         merged["month"] = str(m)
         data.append(merged)
+
 
     df_model = pd.concat(data, ignore_index=True)
 
