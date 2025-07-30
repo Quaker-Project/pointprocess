@@ -79,10 +79,15 @@ gdf_grid["Y"] = gdf_grid.geometry.centroid.y
 gdf_covars, selected_vars = None, []
 if ruta_covariables:
     gdf_covars = cargar_shapefile_zip(ruta_covariables)
-    if gdf_covars is not None:
-        gdf_covars = gdf_covars.to_crs(gdf.crs)
-        numeric_cols = gdf_covars.select_dtypes(include=np.number).columns.tolist()
-        selected_vars = st.multiselect("Selecciona covariables", numeric_cols)
+    if gdf_covars is not None and selected_vars:
+    # Asegurar que merged es un GeoDataFrame válido con geometría
+        if not isinstance(merged, gpd.GeoDataFrame):
+            merged = gpd.GeoDataFrame(merged, geometry='geometry', crs=gdf_grid.crs)
+
+        inter = gpd.sjoin(merged, gdf_covars[selected_vars + ['geometry']], how="left", predicate='intersects')
+        for var in selected_vars:
+            merged[var] = inter.groupby("cell_id")[var].transform("mean")
+
 
 # Fechas
 mes_entreno_inicio = pd.Period(fecha_entreno_inicio, freq="M")
