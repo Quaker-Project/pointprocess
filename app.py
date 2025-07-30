@@ -17,8 +17,8 @@ st.title("Simulación de riesgo espacial de eventos delictivos")
 
 # Parámetros configurables
 ruta_robos = st.file_uploader("Sube shapefile de los eventos (.shp + .shx + .dbf + ... en zip)", type=["zip"])
+ruta_covariables = st.file_uploader("Sube shapefile con covariables (polígonos)", type=["zip"])
 ruta_contorno = st.file_uploader("Opcional: Subir shapefile contorno/calles (.zip)", type=["zip"])
-ruta_covariables = st.file_uploader("Shapefile de covariables por sección censal (.zip)", type=["zip"])
 cell_size = st.number_input("Tamaño celda rejilla (metros)", min_value=100, max_value=2000, value=500, step=100)
 umbral = st.slider("Umbral probabilidad para riesgo", 0.0, 1.0, 0.7, 0.05)
 mes_simulacion = st.text_input("Mes a simular (formato YYYY-MM)", "2019-09")
@@ -31,13 +31,13 @@ def cargar_shapefile_zip(zip_file):
     if zip_file is None:
         return None
     with tempfile.TemporaryDirectory() as tmpdir:
-        with zipfile.ZipFile(zip_file) as z:
-            z.extractall(tmpdir)
-            shp_files = [f for f in os.listdir(tmpdir) if f.endswith(".shp")]
-            if not shp_files:
-                st.error("No se encontró archivo .shp en el zip.")
-                return None
-            return gpd.read_file(os.path.join(tmpdir, shp_files[0]))
+        z = zipfile.ZipFile(zip_file)
+        z.extractall(tmpdir)
+        shp_files = [f for f in os.listdir(tmpdir) if f.endswith(".shp")]
+        if not shp_files:
+            st.error("No se encontró archivo .shp en el zip.")
+            return None
+        return gpd.read_file(os.path.join(tmpdir, shp_files[0]))
 
 if ruta_robos is None:
     st.warning("Sube el shapefile de puntos para continuar.")
@@ -60,7 +60,6 @@ gdf["Fecha"] = gdf["Fecha"].apply(parse_fecha_segura)
 errores = gdf[gdf["Fecha"].isna()]
 if not errores.empty:
     st.warning(f"No se pudieron reconocer {len(errores)} fechas y serán descartadas.")
-
 gdf = gdf.dropna(subset=["Fecha"])
 gdf["month"] = gdf["Fecha"].dt.to_period("M")
 
@@ -79,32 +78,36 @@ gdf_grid = gpd.GeoDataFrame({'cell_id': cell_ids}, geometry=polygons, crs=gdf.cr
 gdf_grid["X"] = gdf_grid.geometry.centroid.x
 gdf_grid["Y"] = gdf_grid.geometry.centroid.y
 
-# Covariables por sección censal
-gdf_covars = None
-selected_vars = []
-if ruta_covariables is not None:
-    gdf_covars = cargar_shapefile_zip(ruta_covariables)
-    if gdf_covars is not None:
-        gdf_covars = gdf_covars.to_crs(gdf_grid.crs)
-        posibles_vars = [col for col in gdf_covars.columns if np.issubdtype(gdf_covars[col].dtype, np.number) and col != 'geometry']
-        selected_vars = st.multiselect("Selecciona variables para usar como covariables", posibles_vars)
-
 mes_entreno_inicio = pd.Period(fecha_entreno_inicio, freq="M")
 mes_entreno_fin = pd.Period(fecha_entreno_fin, freq="M")
 mes_sim = pd.Period(mes_simulacion, freq="M")
 
 train_months = [m for m in sorted(gdf["month"].unique()) if mes_entreno_inicio <= m <= mes_entreno_fin]
-
 if mes_sim not in gdf["month"].unique():
     st.error(f"Mes de simulación {mes_simulacion} no está en los datos.")
     st.stop()
-
 if len(train_months) == 0:
     st.error("No hay meses de entrenamiento válidos en el rango seleccionado.")
     st.stop()
 
 st.write(f"Entrenando con meses desde {fecha_entreno_inicio} hasta {fecha_entreno_fin}")
 st.write(f"Simulando mes: {mes_simulacion}")
+
+# Cargar shapefile de covariables y elegir variables
+gdf_covars = None
+selected_vars = []
+if ruta_covariables is not None:
+    gdf_covars = cargar_shapefile_zip(ruta_covariables)
+    if gdf_covars is not None:
+        gdf_covars = gdf_covars.to_crs(gdf.crs)
+        # Mostrar columnas numéricas (excluyendo geometría) para seleccionar
+        numeric_cols = gdf_covars.select_dtypes(include=[np.number]).columns.tolist()
+        if "geometry" in numeric_cols:
+            numeric_cols.remove("geometry")
+        if numeric_cols:
+            selected_vars = st.multiselect("Selecciona las variables a usar como covariables", numeric_cols)
+        else:
+            st.warning("No se encontraron columnas numéricas en el shapefile de covariables.")
 
 if st.button("Ejecutar simulación"):
 
@@ -115,49 +118,40 @@ if st.button("Ejecutar simulación"):
         joined["label"] = joined["index_right"].notnull().astype(int)
         grouped = joined.groupby("cell_id").agg(label=("label", "max")).reset_index()
         merged = pd.merge(grouped, gdf_grid, on="cell_id")
-
-        if gdf_covars is not None and selected_vars:
-            if not isinstance(merged, gpd.GeoDataFrame):
-                merged = gpd.GeoDataFrame(merged, geometry='geometry', crs=gdf_grid.crs)
-
-            inter = gpd.sjoin(merged, gdf_covars[selected_vars + ['geometry']], how="left", predicate='intersects')
-            for var in selected_vars:
-                merged[var] = inter.groupby("cell_id")[var].transform("mean")
-
         merged["month"] = str(m)
+
+        # Unir covariables con la rejilla (polígonos)
+        if gdf_covars is not None and selected_vars:
+            # Hacemos spatial join entre la rejilla y las covariables (polígonos)
+            inter = gpd.sjoin(merged, gdf_covars[selected_vars + ['geometry']], how="left", predicate='intersects')
+            # Agregar covariables a merged con sufijo para evitar conflictos
+            inter = inter.drop(columns=['index_right'])
+            merged = pd.merge(merged, inter[['cell_id'] + selected_vars], on='cell_id', how='left')
         data.append(merged)
 
     df_model = pd.concat(data, ignore_index=True)
 
-    features = ["X", "Y"] + selected_vars
-    df_model = df_model.dropna(subset=features)
-
-    X = df_model[features]
+    # Variables predictoras: coordenadas + covariables seleccionadas
+    X_cols = ["X", "Y"] + selected_vars if selected_vars else ["X", "Y"]
+    X = df_model[X_cols].fillna(0)
     y = df_model["label"]
 
     model = RandomForestClassifier(n_estimators=100, class_weight="balanced", random_state=42)
     model.fit(X, y)
 
     df_next = gdf_grid.copy()
-
+    X_pred = df_next[["X", "Y"]]
     if gdf_covars is not None and selected_vars:
-        if not isinstance(df_next, gpd.GeoDataFrame):
-            df_next = gpd.GeoDataFrame(df_next, geometry='geometry', crs=gdf_grid.crs)
-
         inter_pred = gpd.sjoin(df_next, gdf_covars[selected_vars + ['geometry']], how="left", predicate='intersects')
-        for var in selected_vars:
-            df_next[var] = inter_pred.groupby("cell_id")[var].transform("mean")
-
-    X_pred = df_next[features].fillna(0)
+        inter_pred = inter_pred.drop(columns=['index_right'])
+        df_next = pd.merge(df_next, inter_pred[['cell_id'] + selected_vars], on='cell_id', how='left')
+        X_pred = df_next[X_cols].fillna(0)
+    else:
+        X_pred = df_next[["X", "Y"]]
 
     probs = model.predict_proba(X_pred)[:, 1]
     df_next["predicted_prob"] = probs
     df_next["predicted_risk"] = (probs >= umbral).astype(int)
-
-    st.write("### Importancia de variables")
-    importances = model.feature_importances_
-    for name, val in zip(features, importances):
-        st.write(f"{name}: {val:.3f}")
 
     gdf_contorno = None
     if ruta_contorno is not None:
@@ -190,6 +184,41 @@ if st.button("Ejecutar simulación"):
     plt.axis("off")
     st.pyplot(fig)
 
+    # Evaluación
     joined_test = gpd.sjoin(df_next, df_test_month, predicate='contains', how='left')
     joined_test["actual_label"] = joined_test["index_right"].notnull().astype(int)
     evaluated = joined_test.groupby("cell_id").agg(
+        actual_label=("actual_label", "max"),
+        predicted_risk=("predicted_risk", "max")
+    ).reset_index()
+
+    precision = precision_score(evaluated["actual_label"], evaluated["predicted_risk"])
+    recall = recall_score(evaluated["actual_label"], evaluated["predicted_risk"])
+    f1 = f1_score(evaluated["actual_label"], evaluated["predicted_risk"])
+
+    st.write("### Métricas de evaluación")
+    st.write(f"Precisión: {precision:.3f}")
+    st.write(f"Recall: {recall:.3f}")
+    st.write(f"F1-score: {f1:.3f}")
+
+    # Exportar GeoJSON y Shapefile
+    def to_geojson_bytes(gdf):
+        return gdf.to_json().encode('utf-8')
+
+    def to_shapefile_bytes(gdf):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            shp_path = os.path.join(tmpdir, "prediccion.shp")
+            gdf.to_file(shp_path)
+            zip_buffer = io.BytesIO()
+            with zipfile.ZipFile(zip_buffer, "w") as zf:
+                for ext in [".shp", ".shx", ".dbf", ".prj", ".cpg"]:
+                    file = os.path.join(tmpdir, f"prediccion{ext}")
+                    if os.path.exists(file):
+                        zf.write(file, arcname=f"prediccion{ext}")
+            return zip_buffer.getvalue()
+
+    geojson_bytes = to_geojson_bytes(df_next)
+    st.download_button("Descargar predicción GeoJSON", geojson_bytes, file_name="prediccion_riesgo.geojson", mime="application/geo+json")
+
+    shapefile_bytes = to_shapefile_bytes(df_next)
+    st.download_button("Descargar predicción Shapefile (zip)", shapefile_bytes, file_name="prediccion_riesgo.zip", mime="application/zip")
